@@ -1,36 +1,49 @@
 import math
 import sys
 import pygame
+import random
 
 pygame.init()
 
+# =========================================================
+# Pantalla real (fullscreen) + render interno (más rápido)
+# =========================================================
+screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
 info = pygame.display.Info()
-WIDTH, HEIGHT = info.current_w, info.current_h
-screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.FULLSCREEN)
-pygame.display.set_caption("Raycaster + Texturas + Joystick Touch + Creador de Niveles (FIX)")
+SCREEN_W, SCREEN_H = info.current_w, info.current_h
+pygame.display.set_caption("Raycaster DOOM-lite + Touch WASD + Look Right Half + Fire")
 pygame.mouse.set_visible(False)
+
+# Render interno (16:9) para ganar FPS
+BASE_W, BASE_H = 960, 540  # si va lento: 800x450
+base = pygame.Surface((BASE_W, BASE_H))
+
+scale = min(SCREEN_W / BASE_W, SCREEN_H / BASE_H)
+FINAL_W, FINAL_H = int(BASE_W * scale), int(BASE_H * scale)
+OFF_X = (SCREEN_W - FINAL_W) // 2
+OFF_Y = (SCREEN_H - FINAL_H) // 2
 
 clock = pygame.time.Clock()
 FPS = 60
 
-# =======================
-# Config
-# =======================
+# =========================================================
+# CONFIG
+# =========================================================
 FOV = math.radians(70)
 HALF_FOV = FOV / 2
+
 NUM_RAYS = 320
 MAX_DEPTH = 30.0
-
-MOVE_SPEED = 3.2
-ROT_SPEED = 2.4
-DEADZONE = 0.08
 EPS = 1e-6
 
-LEVEL_FILE = "level.txt"
+MOVE_SPEED = 3.4
+MOUSE_SENS = 0.0032
 
-# =======================
-# Map (puede tener filas de distinta longitud)
-# =======================
+DEADZONE = 0.08
+
+# =========================================================
+# MAP (se normaliza a rectangular)
+# =========================================================
 WORLD_MAP = [
     "11111111111111111",
     "1000111000110001",
@@ -69,24 +82,17 @@ WORLD_MAP = [
     "1000100000001",
     "111                    1111111",
 ]
+
 def normalize_map(rows):
-    """
-    Convierte el mapa a rectangular (todas las filas mismo ancho).
-    Rellena con '1' (pared) para evitar crashes por longitudes distintas.
-    También fuerza bordes cerrados con '1'.
-    """
     if not rows:
         return ["111", "101", "111"]
-
-    rows = [r.strip() for r in rows if r.strip()]
+    rows = [r.rstrip("\n") for r in rows if r.strip()]
     w = max(len(r) for r in rows)
     out = []
     for r in rows:
         if len(r) < w:
             r = r + ("1" * (w - len(r)))
         out.append(r)
-	
-    # Bordes cerrados
     top = "1" * w
     out[0] = top
     out[-1] = top
@@ -94,7 +100,6 @@ def normalize_map(rows):
         out = ["1" + row[1:-1] + "1" for row in out]
     else:
         out = ["1" for _ in out]
-
     return out
 
 WORLD_MAP = normalize_map(WORLD_MAP)
@@ -124,9 +129,14 @@ def dz(v):
     m = (abs(v) - DEADZONE) / (1.0 - DEADZONE)
     return s * clamp(m, 0.0, 1.0)
 
-# =======================
-# Textura procedural (pared)
-# =======================
+def ang_wrap(a):
+    while a > math.pi: a -= 2*math.pi
+    while a < -math.pi: a += 2*math.pi
+    return a
+
+# =========================================================
+# Textura procedural (pared) + columnas pre-calc
+# =========================================================
 TEX_SIZE = 64
 wall_tex = pygame.Surface((TEX_SIZE, TEX_SIZE)).convert()
 for y in range(TEX_SIZE):
@@ -143,9 +153,11 @@ for y in range(TEX_SIZE):
             c = 120 + ((x * 3 + y * 5) % 40)
         wall_tex.set_at((x, y), (c, c // 2, c // 3))
 
-# =======================
-# Raycasting (DDA + tex coord)
-# =======================
+TEX_COLS = [wall_tex.subsurface((x, 0, 1, TEX_SIZE)).copy() for x in range(TEX_SIZE)]
+
+# =========================================================
+# Raycasting
+# =========================================================
 def cast_ray(px, py, angle):
     ray_dx = math.cos(angle)
     ray_dy = math.sin(angle)
@@ -204,18 +216,42 @@ def cast_ray(px, py, angle):
     dist = max(0.01, min(MAX_DEPTH, dist))
     return dist, shade, tex_u
 
-# =======================
-# Joystick touch (UNO) - X gira, Y mueve
-# Compatible con FINGER y MOUSE
-# =======================
-JOY_R = int(min(WIDTH, HEIGHT) * 0.25)
-JOY_CENTER = [JOY_R + 60, HEIGHT - JOY_R - 60]
-joy_knob = JOY_CENTER.copy()
-joy_val = [0.0, 0.0]
-touch_active = False
-LEFT_HALF = pygame.Rect(0, 0, WIDTH // 2, HEIGHT)
+# =========================================================
+# INPUT mapping: pantalla real -> base
+# =========================================================
+def screen_to_base(sx, sy):
+    bx = (sx - OFF_X) / scale
+    by = (sy - OFF_Y) / scale
+    inside = (0 <= bx < BASE_W) and (0 <= by < BASE_H)
+    return int(bx), int(by), inside
 
-def set_knob_from_pos(x, y):
+# =========================================================
+# UI
+# =========================================================
+ui_font = pygame.font.SysFont(None, 22)
+
+def draw_crosshair(surf):
+    cx, cy = BASE_W//2, BASE_H//2
+    pygame.draw.line(surf, (255,255,255), (cx-8, cy), (cx+8, cy), 1)
+    pygame.draw.line(surf, (255,255,255), (cx, cy-8), (cx, cy+8), 1)
+
+# =========================================================
+# JOYSTICK MOVIMIENTO (WASD COMPLETO)
+#   joy_move_x = strafe (A/D)
+#   joy_move_y = forward/back (W/S)
+# =========================================================
+JOY_R = int(min(BASE_W, BASE_H) * 0.23)
+JOY_CENTER = [JOY_R + 40, BASE_H - JOY_R - 40]
+joy_knob = JOY_CENTER.copy()
+joy_move_x = 0.0
+joy_move_y = 0.0
+touch_move_active = False
+move_touch_id = None
+
+LEFT_HALF = pygame.Rect(0, 0, BASE_W // 2, BASE_H)
+
+def set_joy_from_pos(x, y):
+    global joy_move_x, joy_move_y
     vx = x - JOY_CENTER[0]
     vy = y - JOY_CENTER[1]
     d = math.hypot(vx, vy)
@@ -226,182 +262,176 @@ def set_knob_from_pos(x, y):
     joy_knob[0] = JOY_CENTER[0] + vx
     joy_knob[1] = JOY_CENTER[1] + vy
 
-    joy_val[0] = dz(vx / JOY_R)   # X = girar
-    joy_val[1] = dz(vy / JOY_R)   # Y = mover
+    joy_move_x = dz(vx / JOY_R)    # A/D
+    joy_move_y = dz(vy / JOY_R)    # arriba negativo -> W
+    joy_move_y = -joy_move_y       # invertimos para que arriba sea +forward
 
 def reset_joystick():
+    global joy_move_x, joy_move_y
     joy_knob[0], joy_knob[1] = JOY_CENTER[0], JOY_CENTER[1]
-    joy_val[0], joy_val[1] = 0.0, 0.0
+    joy_move_x, joy_move_y = 0.0, 0.0
 
-def draw_joystick():
-    pygame.draw.circle(screen, (255, 255, 255), (int(JOY_CENTER[0]), int(JOY_CENTER[1])), JOY_R, 2)
-    pygame.draw.circle(screen, (255, 255, 255), (int(joy_knob[0]), int(joy_knob[1])), JOY_R // 2, 2)
+def draw_joystick(surf):
+    pygame.draw.circle(surf, (255,255,255), (int(JOY_CENTER[0]), int(JOY_CENTER[1])), JOY_R, 2)
+    pygame.draw.circle(surf, (255,255,255), (int(joy_knob[0]), int(joy_knob[1])), JOY_R//2, 2)
 
-# =======================
-# Editor de niveles (FIX: layout adaptable + 2 dedos)
-# =======================
-font = pygame.font.SysFont(None, 26)
-edit_mode = False
-status_msg = ""
-status_timer = 0.0
+# =========================================================
+# FIRE button (touch)
+# =========================================================
+FIRE_BTN = pygame.Rect(BASE_W - 150, BASE_H - 150, 120, 120)
+touch_fire = False
+fire_touch_id = None
 
-fingers_down = set()  # para detectar 2 dedos
+def draw_fire_btn(surf):
+    pygame.draw.rect(surf, (200, 60, 60), FIRE_BTN, border_radius=16)
+    pygame.draw.rect(surf, (255,255,255), FIRE_BTN, 2, border_radius=16)
+    t = ui_font.render("FIRE", True, (255,255,255))
+    surf.blit(t, (FIRE_BTN.centerx - t.get_width()//2, FIRE_BTN.centery - t.get_height()//2))
 
-GRID_PAD = 12
-BTN_H = 44
-BTN_W = 160
-BTN_GAP = 10
-EDITOR_MARGIN_BOTTOM = 110  # espacio para botones + texto
+# =========================================================
+# LOOK AREA: mitad derecha de la pantalla (sin tapar FIRE)
+# =========================================================
+LOOK_AREA = pygame.Rect(BASE_W//2, 0, BASE_W//2, BASE_H)
 
-def set_status(text, seconds=1.6):
-    global status_msg, status_timer
-    status_msg = text
-    status_timer = seconds
+touch_look_active = False
+look_touch_id = None
+look_lastx = 0
 
-def compute_editor_layout():
-    """
-    Devuelve: grid_scale, grid_rect, btn_edit, btn_save, btn_load, help_pos
-    Garantiza que el grid y botones queden dentro de pantalla.
-    """
-    max_w = int(WIDTH * 0.55)              # editor ocupa ~mitad izquierda
-    max_h = HEIGHT - EDITOR_MARGIN_BOTTOM  # deja espacio para botones/texto
+def draw_look_area_hint(surf):
+    # dibujamos borde (opcional) pero recortado para que no tape FIRE
+    pygame.draw.rect(surf, (255,255,255), LOOK_AREA, 1)
+    # "agujero" visual sobre FIRE (solo guía)
+    pygame.draw.rect(surf, (0,0,0), FIRE_BTN.inflate(6, 6), 1)
 
-    if MAP_W <= 0 or MAP_H <= 0:
-        scale = 20
-    else:
-        scale_w = max(10, max_w // MAP_W)
-        scale_h = max(10, max_h // MAP_H)
-        scale = max(10, min(scale_w, scale_h))
+# =========================================================
+# Enemigos + Fireballs
+# =========================================================
+class Enemy:
+    def __init__(self, x, y):
+        self.x = float(x)
+        self.y = float(y)
+        self.hp = 70
+        self.cool = random.uniform(0.8, 1.8)
 
-    grid_w = MAP_W * scale
-    grid_h = MAP_H * scale
-    grid_rect = pygame.Rect(GRID_PAD, GRID_PAD, grid_w, grid_h)
+class Fireball:
+    def __init__(self, x, y, vx, vy):
+        self.x = float(x)
+        self.y = float(y)
+        self.vx = float(vx)
+        self.vy = float(vy)
+        self.life = 4.0
 
-    # Botones: por defecto debajo del grid
-    btn_y = grid_rect.bottom + 12
-    btn_edit = pygame.Rect(GRID_PAD, btn_y, BTN_W, BTN_H)
-    btn_save = pygame.Rect(GRID_PAD + BTN_W + BTN_GAP, btn_y, BTN_W, BTN_H)
-    btn_load = pygame.Rect(GRID_PAD + (BTN_W + BTN_GAP) * 2, btn_y, BTN_W, BTN_H)
+enemies = []
+fireballs = []
 
-    # Si no entran, los ponemos en columna arriba-derecha
-    if (btn_load.right > WIDTH - GRID_PAD) or (btn_y + BTN_H > HEIGHT - GRID_PAD):
-        top_y = GRID_PAD
-        right_x = WIDTH - GRID_PAD - BTN_W
-        btn_edit = pygame.Rect(right_x, top_y, BTN_W, BTN_H)
-        btn_save = pygame.Rect(right_x, top_y + BTN_H + BTN_GAP, BTN_W, BTN_H)
-        btn_load = pygame.Rect(right_x, top_y + (BTN_H + BTN_GAP) * 2, BTN_W, BTN_H)
-        help_pos = (GRID_PAD, grid_rect.bottom + 12)
-    else:
-        help_pos = (GRID_PAD, btn_edit.bottom + 10)
+def line_of_sight(px, py, tx, ty):
+    ang = math.atan2(ty - py, tx - px)
+    dist_target = math.hypot(tx - px, ty - py)
+    d, _, _ = cast_ray(px, py, ang)
+    return d + 0.15 >= dist_target
 
-    return scale, grid_rect, btn_edit, btn_save, btn_load, help_pos
+def spawn_some_enemies(px, py):
+    enemies.clear()
+    fireballs.clear()
+    tries = 0
+    while len(enemies) < 6 and tries < 2000:
+        tries += 1
+        gx = random.randint(1, MAP_W - 2)
+        gy = random.randint(1, MAP_H - 2)
+        if WORLD_MAP[gy][gx] == "0":
+            ex, ey = gx + 0.5, gy + 0.5
+            if math.hypot(ex - px, ey - py) > 4.0:
+                enemies.append(Enemy(ex, ey))
 
-def draw_button(rect, label, active=False):
-    col = (70, 70, 90) if not active else (110, 110, 150)
-    pygame.draw.rect(screen, col, rect, border_radius=10)
-    pygame.draw.rect(screen, (220, 220, 220), rect, 2, border_radius=10)
-    t = font.render(label, True, (240, 240, 240))
-    screen.blit(t, (rect.x + (rect.w - t.get_width()) // 2,
-                    rect.y + (rect.h - t.get_height()) // 2))
+# sprites placeholders
+enemy_sprite = pygame.Surface((64, 64), pygame.SRCALPHA)
+pygame.draw.circle(enemy_sprite, (220, 60, 60), (32, 32), 28)
+pygame.draw.circle(enemy_sprite, (0, 0, 0), (24, 26), 6)
+pygame.draw.circle(enemy_sprite, (0, 0, 0), (40, 26), 6)
+pygame.draw.rect(enemy_sprite, (0,0,0), (18, 40, 28, 10), border_radius=5)
 
-def grid_cell_from_screen(x, y, grid_rect, grid_scale):
-    if not grid_rect.collidepoint(x, y):
-        return None
-    gx = (x - grid_rect.x) // grid_scale
-    gy = (y - grid_rect.y) // grid_scale
-    if 0 <= gx < MAP_W and 0 <= gy < MAP_H:
-        return int(gx), int(gy)
-    return None
+fire_sprite = pygame.Surface((32, 32), pygame.SRCALPHA)
+pygame.draw.circle(fire_sprite, (255, 120, 0), (16, 16), 12)
+pygame.draw.circle(fire_sprite, (255, 220, 0), (16, 16), 7)
 
-def set_cell(gx, gy, val_char):
-    global WORLD_MAP
-    row = WORLD_MAP[gy]
-    if row[gx] == val_char:
+def draw_sprite(surf, sprite, sx, sy, size):
+    if size <= 2:
         return
-    WORLD_MAP = WORLD_MAP[:]
-    WORLD_MAP[gy] = row[:gx] + val_char + row[gx + 1:]
+    img = pygame.transform.scale(sprite, (size, size))
+    surf.blit(img, (sx - size//2, sy - size//2))
 
-def toggle_cell(gx, gy):
-    # no abrir bordes
-    if gx == 0 or gy == 0 or gx == MAP_W - 1 or gy == MAP_H - 1:
+# =========================================================
+# 1 ARMA: pistola (hitscan)
+# =========================================================
+WEAPON_NAME = "PISTOL"
+SHOT_RATE = 0.35
+SHOT_DAMAGE = 22
+shot_timer = 0.0
+muzzle_timer = 0.0
+
+def best_target_in_crosshair(px, py, pa, zbuf_px):
+    center_x = BASE_W // 2
+    best = None
+    best_dist = 1e9
+    for en in enemies:
+        if en.hp <= 0:
+            continue
+        dx = en.x - px
+        dy = en.y - py
+        dist = math.hypot(dx, dy)
+        if dist < 0.35 or dist > MAX_DEPTH:
+            continue
+
+        ang = math.atan2(dy, dx)
+        diff = ang_wrap(ang - pa)
+        if abs(diff) > HALF_FOV:
+            continue
+
+        screen_x = int((diff + HALF_FOV) / FOV * BASE_W)
+        if abs(screen_x - center_x) > 28:
+            continue
+
+        if 0 <= screen_x < BASE_W:
+            if dist > zbuf_px[screen_x] + 0.10:
+                continue
+
+        if dist < best_dist and line_of_sight(px, py, en.x, en.y):
+            best_dist = dist
+            best = en
+    return best
+
+def shoot(px, py, pa, zbuf_px):
+    global shot_timer, muzzle_timer
+    if shot_timer > 0:
         return
-    set_cell(gx, gy, "0" if WORLD_MAP[gy][gx] == "1" else "1")
+    shot_timer = SHOT_RATE
+    muzzle_timer = 0.08
+    target = best_target_in_crosshair(px, py, pa, zbuf_px)
+    if target:
+        target.hp -= SHOT_DAMAGE
 
-def save_level(path=LEVEL_FILE):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            for row in WORLD_MAP:
-                f.write(row + "\n")
-        set_status(f"Guardado: {path}")
-    except Exception as ex:
-        set_status(f"Error guardando: {ex}", 2.2)
-
-def load_level(path=LEVEL_FILE):
-    global WORLD_MAP, MAP_W, MAP_H, px, py
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            rows = [line.strip() for line in f.readlines() if line.strip()]
-        WORLD_MAP = normalize_map(rows)
-        MAP_W = len(WORLD_MAP[0])
-        MAP_H = len(WORLD_MAP)
-        px, py = find_spawn()
-        set_status(f"Cargado: {path}")
-    except FileNotFoundError:
-        set_status("No existe level.txt (primero guardá)", 2.0)
-    except Exception as ex:
-        set_status(f"Error cargando: {ex}", 2.2)
-
-def draw_editor_overlay(player_x, player_y):
-    grid_scale, grid_rect, btn_edit, btn_save, btn_load, help_pos = compute_editor_layout()
-
-    # oscurece fondo
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, 120))
-    screen.blit(overlay, (0, 0))
-
-    # grilla
-    for gy in range(MAP_H):
-        for gx in range(MAP_W):
-            cell = WORLD_MAP[gy][gx]
-            r = pygame.Rect(grid_rect.x + gx * grid_scale,
-                            grid_rect.y + gy * grid_scale,
-                            grid_scale, grid_scale)
-            if cell == "1":
-                pygame.draw.rect(screen, (200, 200, 220), r)
-            else:
-                pygame.draw.rect(screen, (40, 40, 55), r)
-            pygame.draw.rect(screen, (20, 20, 30), r, 1)
-
-    # jugador
-    pgx, pgy = int(player_x), int(player_y)
-    if 0 <= pgx < MAP_W and 0 <= pgy < MAP_H:
-        pr = pygame.Rect(grid_rect.x + pgx * grid_scale,
-                         grid_rect.y + pgy * grid_scale,
-                         grid_scale, grid_scale)
-        pygame.draw.rect(screen, (255, 120, 120), pr, 3)
-
-    # ayuda
-    t1 = font.render("Editor: tocá celdas para poner/quitar paredes", True, (240, 240, 240))
-    t2 = font.render("Atajo: 2 dedos = abrir/cerrar editor", True, (240, 240, 240))
-    screen.blit(t1, help_pos)
-    screen.blit(t2, (help_pos[0], help_pos[1] + 26))
-
-    return grid_scale, grid_rect, btn_edit, btn_save, btn_load
-
-# =======================
-# Player
-# =======================
-px, py = find_spawn()   # spawn seguro (NO adentro de pared)
+# =========================================================
+# PLAYER
+# =========================================================
+px, py = find_spawn()
 pa = 0.0
+player_hp = 100
+hurt_cd = 0.0
+
+spawn_some_enemies(px, py)
+
+pygame.event.set_grab(True)
+pygame.mouse.set_pos((SCREEN_W//2, SCREEN_H//2))
 
 running = True
 while running:
     dt = clock.tick(FPS) / 1000.0
 
-    if status_timer > 0:
-        status_timer -= dt
-        if status_timer <= 0:
-            status_msg = ""
+    if shot_timer > 0: shot_timer -= dt
+    if muzzle_timer > 0: muzzle_timer -= dt
+    if hurt_cd > 0: hurt_cd -= dt
+
+    touch_fire = False
 
     for e in pygame.event.get():
         if e.type == pygame.QUIT:
@@ -410,171 +440,248 @@ while running:
         if e.type == pygame.KEYDOWN:
             if e.key == pygame.K_ESCAPE:
                 running = False
-            if e.key == pygame.K_e:
-                edit_mode = not edit_mode
-                set_status("Editor ON" if edit_mode else "Editor OFF")
-                touch_active = False
-                reset_joystick()
-            if e.key == pygame.K_s:
-                save_level()
-            if e.key == pygame.K_l:
-                load_level()
 
-        # ---- Touch FINGER: 2 dedos para toggle editor ----
+        # Mouse look (PC)
+        if e.type == pygame.MOUSEMOTION:
+            relx, _ = e.rel
+            pa = (pa + relx * MOUSE_SENS) % (2*math.pi)
+
+        if e.type == pygame.MOUSEBUTTONDOWN:
+            if e.button == 1:
+                touch_fire = True
+
+        # Touch
         if e.type == pygame.FINGERDOWN:
-            fingers_down.add(e.finger_id)
-            if len(fingers_down) >= 2:
-                edit_mode = not edit_mode
-                set_status("Editor ON" if edit_mode else "Editor OFF")
-                touch_active = False
-                reset_joystick()
-                # no hagas nada más con este evento (evita activar joystick)
+            sxp = int(e.x * SCREEN_W)
+            syp = int(e.y * SCREEN_H)
+            x, y, inside = screen_to_base(sxp, syp)
+            if not inside:
                 continue
 
-            x = int(e.x * WIDTH)
-            y = int(e.y * HEIGHT)
-
-            # Si editor: interactuar con UI / grid
-            if edit_mode:
-                grid_scale, grid_rect, btn_edit, btn_save, btn_load = draw_editor_overlay(px, py)
-
-                if btn_edit.collidepoint(x, y):
-                    edit_mode = False
-                    set_status("Editor OFF")
-                elif btn_save.collidepoint(x, y):
-                    save_level()
-                elif btn_load.collidepoint(x, y):
-                    load_level()
-                else:
-                    cell = grid_cell_from_screen(x, y, grid_rect, grid_scale)
-                    if cell:
-                        gx, gy = cell
-                        toggle_cell(gx, gy)
-                        if is_wall(px, py):
-                            px, py = find_spawn()
+            # 1) FIRE siempre primero (prioridad)
+            if FIRE_BTN.collidepoint(x, y):
+                touch_fire = True
+                fire_touch_id = e.finger_id
                 continue
 
-            # Si juego: joystick (mitad izquierda)
+            # 2) Movimiento con joystick (mitad izquierda)
             if LEFT_HALF.collidepoint(x, y):
-                touch_active = True
+                touch_move_active = True
+                move_touch_id = e.finger_id
                 JOY_CENTER[0], JOY_CENTER[1] = x, y
-                set_knob_from_pos(x, y)
+                set_joy_from_pos(x, y)
+                continue
 
-        if e.type == pygame.FINGERMOTION and touch_active and (not edit_mode):
-            x = int(e.x * WIDTH)
-            y = int(e.y * HEIGHT)
-            set_knob_from_pos(x, y)
+            # 3) Look: mitad derecha (pero NO dentro del FIRE)
+            if LOOK_AREA.collidepoint(x, y) and (not FIRE_BTN.collidepoint(x, y)):
+                touch_look_active = True
+                look_touch_id = e.finger_id
+                look_lastx = x
+                continue
+
+        if e.type == pygame.FINGERMOTION:
+            sxp = int(e.x * SCREEN_W)
+            syp = int(e.y * SCREEN_H)
+            x, y, inside = screen_to_base(sxp, syp)
+            if not inside:
+                continue
+
+            if touch_look_active and e.finger_id == look_touch_id:
+                dx = x - look_lastx
+                look_lastx = x
+                pa = (pa + dx * 0.010) % (2*math.pi)
+
+            if touch_move_active and e.finger_id == move_touch_id:
+                set_joy_from_pos(x, y)
 
         if e.type == pygame.FINGERUP:
-            fingers_down.discard(e.finger_id)
-            if touch_active:
-                touch_active = False
+            if e.finger_id == fire_touch_id:
+                fire_touch_id = None
+            if touch_look_active and e.finger_id == look_touch_id:
+                touch_look_active = False
+                look_touch_id = None
+            if touch_move_active and e.finger_id == move_touch_id:
+                touch_move_active = False
+                move_touch_id = None
                 reset_joystick()
 
-        # ---- Mouse fallback (algunos Android) ----
-        if e.type == pygame.MOUSEBUTTONDOWN:
-            x, y = e.pos
+    # =========================================================
+    # Movimiento: WASD + Joystick (WASD)
+    # =========================================================
+    keys = pygame.key.get_pressed()
+    forward = (1 if keys[pygame.K_w] else 0) + (-1 if keys[pygame.K_s] else 0)
+    strafe  = (1 if keys[pygame.K_d] else 0) + (-1 if keys[pygame.K_a] else 0)
 
-            if edit_mode:
-                grid_scale, grid_rect, btn_edit, btn_save, btn_load = draw_editor_overlay(px, py)
+    # Touch joystick suma
+    forward += joy_move_y
+    strafe  += joy_move_x
 
-                if btn_edit.collidepoint(x, y):
-                    edit_mode = False
-                    set_status("Editor OFF")
-                elif btn_save.collidepoint(x, y):
-                    save_level()
-                elif btn_load.collidepoint(x, y):
-                    load_level()
-                else:
-                    cell = grid_cell_from_screen(x, y, grid_rect, grid_scale)
-                    if cell:
-                        gx, gy = cell
-                        toggle_cell(gx, gy)
-                        if is_wall(px, py):
-                            px, py = find_spawn()
-                continue
+    forward = clamp(forward, -1.0, 1.0)
+    strafe  = clamp(strafe, -1.0, 1.0)
 
-            if LEFT_HALF.collidepoint(x, y):
-                touch_active = True
-                JOY_CENTER[0], JOY_CENTER[1] = x, y
-                set_knob_from_pos(x, y)
+    dx = math.cos(pa)
+    dy = math.sin(pa)
+    sxv = -dy
+    syv = dx
 
-        if e.type == pygame.MOUSEMOTION and touch_active and (not edit_mode):
-            x, y = e.pos
-            set_knob_from_pos(x, y)
+    nx = px + (dx * forward + sxv * strafe) * MOVE_SPEED * dt
+    ny = py + (dy * forward + syv * strafe) * MOVE_SPEED * dt
 
-        if e.type == pygame.MOUSEBUTTONUP and touch_active:
-            touch_active = False
-            reset_joystick()
+    if not is_wall(nx, py): px = nx
+    if not is_wall(px, ny): py = ny
 
-    # =======================
-    # Movimiento (solo en modo juego)
-    # =======================
-    if not edit_mode:
-        turn = joy_val[0]
-        move = -joy_val[1]  # arriba=adelante
-
-        pa = (pa + turn * ROT_SPEED * dt) % math.tau
-
-        dx = math.cos(pa)
-        dy = math.sin(pa)
-
-        nx = px + dx * move * MOVE_SPEED * dt
-        ny = py + dy * move * MOVE_SPEED * dt
-
-        if not is_wall(nx, py): px = nx
-        if not is_wall(px, ny): py = ny
-
-    # =======================
-    # Render 3D
-    # =======================
-    screen.fill((0, 0, 0))
-    pygame.draw.rect(screen, (35, 35, 55), (0, 0, WIDTH, HEIGHT // 2))
-    pygame.draw.rect(screen, (25, 22, 18), (0, HEIGHT // 2, WIDTH, HEIGHT // 2))
+    # =========================================================
+    # Render 3D + zbuffer por pixel
+    # =========================================================
+    base.fill((0, 0, 0))
+    pygame.draw.rect(base, (35, 35, 55), (0, 0, BASE_W, BASE_H // 2))
+    pygame.draw.rect(base, (25, 22, 18), (0, BASE_H // 2, BASE_W, BASE_H // 2))
 
     start_angle = pa - HALF_FOV
     ray_step = FOV / NUM_RAYS
-    col_w = (WIDTH / NUM_RAYS)
+    col_w = BASE_W / NUM_RAYS
+
+    zbuf_px = [MAX_DEPTH] * BASE_W
 
     for i in range(NUM_RAYS):
         angle = start_angle + i * ray_step
         dist, shade, tex_u = cast_ray(px, py, angle)
-        dist *= math.cos(pa - angle)  # fish-eye correction
+        dist_corr = dist * math.cos(pa - angle)
+        dist_corr = max(0.01, dist_corr)
 
-        wall_h = int((HEIGHT * 0.9) / max(0.01, dist))
-        wall_h = min(HEIGHT, wall_h)
-
-        x = int(i * col_w)
-        w = int(col_w) + 1
-        y0 = (HEIGHT // 2) - (wall_h // 2)
+        wall_h = int((BASE_H * 0.9) / dist_corr)
+        wall_h = min(BASE_H, wall_h)
+        y0 = (BASE_H // 2) - (wall_h // 2)
 
         tex_x = int(tex_u * (TEX_SIZE - 1))
         tex_x = int(clamp(tex_x, 0, TEX_SIZE - 1))
 
-        column = wall_tex.subsurface((tex_x, 0, 1, TEX_SIZE))
-        column_scaled = pygame.transform.scale(column, (w, wall_h))
+        w = int(col_w) + 1
+        x0 = int(i * col_w)
 
-        fog = clamp(1.0 - (dist / MAX_DEPTH), 0.15, 1.0)
+        col = TEX_COLS[tex_x]
+        col_scaled = pygame.transform.scale(col, (w, wall_h))
+
+        fog = clamp(1.0 - (dist_corr / MAX_DEPTH), 0.15, 1.0)
         intensity = fog * shade
         mult = int(255 * intensity)
 
-        img = column_scaled.copy()
+        img = col_scaled.copy()
         img.fill((mult, mult, mult), special_flags=pygame.BLEND_RGB_MULT)
-        screen.blit(img, (x, y0))
+        base.blit(img, (x0, y0))
 
+        for xx in range(x0, min(BASE_W, x0 + w)):
+            zbuf_px[xx] = dist_corr
+
+    # =========================================================
+    # Enemigos disparan + fuego
+    # =========================================================
+    for en in enemies[:]:
+        if en.hp <= 0:
+            enemies.remove(en)
+            continue
+
+        dist = math.hypot(en.x - px, en.y - py)
+        en.cool -= dt
+
+        if dist < 12.0 and en.cool <= 0.0 and line_of_sight(px, py, en.x, en.y):
+            en.cool = random.uniform(0.8, 1.6)
+            ang = math.atan2(py - en.y, px - en.x)
+            spd = 5.0
+            fireballs.append(Fireball(en.x, en.y, math.cos(ang)*spd, math.sin(ang)*spd))
+
+    for fb in fireballs[:]:
+        fb.life -= dt
+        if fb.life <= 0:
+            fireballs.remove(fb)
+            continue
+
+        nx = fb.x + fb.vx * dt
+        ny = fb.y + fb.vy * dt
+        if is_wall(nx, ny):
+            fireballs.remove(fb)
+            continue
+        fb.x, fb.y = nx, ny
+
+        if math.hypot(fb.x - px, fb.y - py) < 0.35 and hurt_cd <= 0:
+            player_hp -= 12
+            hurt_cd = 0.6
+            fireballs.remove(fb)
+            if player_hp <= 0:
+                px, py = find_spawn()
+                pa = 0.0
+                player_hp = 100
+                spawn_some_enemies(px, py)
+
+    # =========================================================
+    # Render sprites (enemigos + fireballs)
+    # =========================================================
+    for en in enemies:
+        dxp = en.x - px
+        dyp = en.y - py
+        dist = math.hypot(dxp, dyp)
+        if dist < 0.01 or dist > MAX_DEPTH:
+            continue
+        ang = math.atan2(dyp, dxp)
+        diff = ang_wrap(ang - pa)
+        if abs(diff) > HALF_FOV:
+            continue
+
+        sx = int((diff + HALF_FOV) / FOV * BASE_W)
+        size = int((BASE_H * 0.85) / dist)
+        size = int(clamp(size, 8, 260))
+
+        if 0 <= sx < BASE_W and dist <= zbuf_px[sx] + 0.10:
+            draw_sprite(base, enemy_sprite, sx, BASE_H//2 + size//6, size)
+
+    for fb in fireballs:
+        dxp = fb.x - px
+        dyp = fb.y - py
+        dist = math.hypot(dxp, dyp)
+        if dist < 0.01 or dist > MAX_DEPTH:
+            continue
+        ang = math.atan2(dyp, dxp)
+        diff = ang_wrap(ang - pa)
+        if abs(diff) > HALF_FOV:
+            continue
+
+        sx = int((diff + HALF_FOV) / FOV * BASE_W)
+        size = int((BASE_H * 0.35) / dist)
+        size = int(clamp(size, 6, 90))
+
+        if 0 <= sx < BASE_W and dist <= zbuf_px[sx] + 0.08:
+            draw_sprite(base, fire_sprite, sx, BASE_H//2, size)
+
+    # =========================================================
+    # Disparo (cuando ya existe zbuffer)
+    # =========================================================
+    if touch_fire:
+        shoot(px, py, pa, zbuf_px)
+
+    # =========================================================
     # UI
-    if edit_mode:
-        draw_editor_overlay(px, py)
-    else:
-        draw_joystick()
-        # tip rápido
-        tip = font.render("2 dedos = Editor | Arriba/abajo mueve | Izq/der gira", True, (220, 220, 220))
-        screen.blit(tip, (16, 16))
+    # =========================================================
+    draw_joystick(base)
+    draw_fire_btn(base)
+    draw_crosshair(base)
+    draw_look_area_hint(base)
 
-    if status_msg:
-        s = font.render(status_msg, True, (255, 255, 255))
-        screen.blit(s, (WIDTH - s.get_width() - 16, 16))
+    hp_txt = ui_font.render(f"HP: {player_hp}", True, (255,255,255))
+    we_txt = ui_font.render(f"WEAPON: {WEAPON_NAME}", True, (255,255,255))
+    en_txt = ui_font.render(f"ENEMIES: {len(enemies)}", True, (255,255,255))
+    base.blit(hp_txt, (10, 10))
+    base.blit(we_txt, (10, 32))
+    base.blit(en_txt, (10, 54))
 
+    if muzzle_timer > 0:
+        pygame.draw.circle(base, (255, 230, 120), (BASE_W//2, BASE_H//2), 18)
+
+    # =========================================================
+    # Presentación con letterbox
+    # =========================================================
+    scaled = pygame.transform.scale(base, (FINAL_W, FINAL_H))
+    screen.fill((0, 0, 0))
+    screen.blit(scaled, (OFF_X, OFF_Y))
     pygame.display.flip()
 
 pygame.quit()
