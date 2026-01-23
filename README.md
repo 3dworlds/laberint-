@@ -1,2 +1,1 @@
-Warning:This game is in beta, so please do not report bugs. 
-The game will be in .py until we make it .exe
+the game is do whit Chat GPT i don´t say this before but i need to change the readme
